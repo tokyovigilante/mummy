@@ -24,8 +24,13 @@ when defined(linux):
     {.importc: "SOCK_NONBLOCK", header: "<sys/socket.h>".}: cint
 
 when defined(windows):
+  let IPV6_V6ONLY {.importc, header: "<ws2tcpip.h>".}: cint
+elif defined(posix) and not defined(linux):
+  from std/posix import IPV6_V6ONLY
+
+when defined(windows):
   from std/winlean import TCP_NODELAY
-elif defined(posix):
+elif defined(posix) and not defined(linux):
   from std/posix import TCP_NODELAY
 
 import std/locks
@@ -1277,19 +1282,19 @@ proc loopForever(server: Server) {.raises: [OSError, IOSelectorsException].} =
           let (clientSocket, remoteAddress) =
             when defined(linux) and not defined(nimdoc):
               var
-                sockAddr: SockAddr
+                sockAddr: Sockaddr_storage
                 addrLen = sizeof(sockAddr).SockLen
               let
                 socket =
                   accept4(
                     server.socket,
-                    sockAddr.addr,
+                    cast[ptr SockAddr](sockAddr.addr),
                     addrLen.addr,
                     SOCK_CLOEXEC or SOCK_NONBLOCK
                   )
                 sockAddrStr =
                   try:
-                    getAddrString(sockAddr.addr)
+                    getAddrString(cast[ptr SockAddr](sockAddr.addr))
                   except Exception as e:
                     ""
               (socket, sockAddrStr)
@@ -1414,37 +1419,52 @@ proc close*(server: Server) {.raises: [], gcsafe.} =
 proc serve*(
   server: Server,
   port: Port,
-  address = "localhost"
+  address = "127.0.0.1"
 ) {.raises: [MummyError].} =
-  ## The server will serve on the address and port. The default address is
-  ## localhost. Use "0.0.0.0" to make the server externally accessible (with
-  ## caution).
-  ## This call does not return unless server.close() is called from another
-  ## thread.
+  ## Serve on `address:port`. Default `"127.0.0.1"` is IPv4 loopback only —
+  ## external interfaces and IPv6 are opt-in.
+  ##
+  ## Examples:
+  ##   serve(Port(8081))                # IPv4 loopback only (default)
+  ##   serve(Port(8081), "0.0.0.0")     # IPv4-only, all interfaces
+  ##   serve(Port(8081), "::1")         # IPv6 loopback only
+  ##   serve(Port(8081), "::")          # dual-stack (IPv4+IPv6) all interfaces
+  ##                                    # via IPV6_V6ONLY=0 + IPv4-mapped IPv6
+  ##
+  ## Does not return until server.close() is called from another thread.
 
   if server.socket.int != 0:
     raise newException(MummyError, "Server already has a socket")
 
   try:
+    # Resolve the address to determine IPv4 vs IPv6
+    let ai = getAddrInfo(
+      address,
+      port,
+      Domain.AF_UNSPEC,
+      SockType.SOCK_STREAM,
+      Protocol.IPPROTO_TCP,
+    )
+
+    let domain = cast[Domain](ai.ai_family)
+
     server.socket = createNativeSocket(
-      Domain.AF_INET,
+      domain,
       SockType.SOCK_STREAM,
       Protocol.IPPROTO_TCP,
       false
     )
     if server.socket == osInvalidSocket:
+      freeAddrInfo(ai)
       raiseOSError(osLastError())
 
     server.socket.setBlocking(false)
     server.socket.setSockOptInt(SOL_SOCKET, SO_REUSEADDR, 1)
 
-    let ai = getAddrInfo(
-      address,
-      port,
-      Domain.AF_INET,
-      SockType.SOCK_STREAM,
-      Protocol.IPPROTO_TCP,
-    )
+    if domain == Domain.AF_INET6:
+      server.socket.setSockOptInt(
+        Protocol.IPPROTO_IPV6.toInt.int, IPV6_V6ONLY.int, 0)
+
     try:
       if bindAddr(server.socket, ai.ai_addr, ai.ai_addrlen.SockLen) < 0:
         raiseOSError(osLastError())
